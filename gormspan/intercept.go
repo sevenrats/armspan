@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
 	"reflect"
 	"time"
 
@@ -18,6 +19,20 @@ import (
 // processor from executing. It is cleared immediately after in the
 // corresponding "clear" callback so the caller never sees it.
 var errIntercepted = errors.New("gormspan: write intercepted")
+
+// httpClient is a shared HTTP client with sensible timeouts.
+var httpClient = &http.Client{
+	Timeout: 10 * time.Second,
+}
+
+// SetHTTPClient allows replacing the default HTTP client, e.g. for
+// testing or to inject custom transports / TLS configuration.
+func SetHTTPClient(c *http.Client) {
+	if c == nil {
+		panic("gormspan: SetHTTPClient called with nil")
+	}
+	httpClient = c
+}
 
 // ---------------------------------------------------------------------------
 // Context-based bypass
@@ -45,27 +60,28 @@ func isDirectWrite(ctx context.Context) bool {
 }
 
 // ---------------------------------------------------------------------------
-// WriteEvent — the JSON payload sent to the notify endpoint
+// ManifestChange — the JSON payload POSTed to the endpoint
 // ---------------------------------------------------------------------------
 
-// WriteEvent is the JSON payload sent to NotifyURL when a write on a
-// target table is intercepted. The receiving service evaluates business
-// logic and ultimately writes the (potentially transformed) data to the
-// database using [WithDirectWrite] to bypass re-interception.
-type WriteEvent struct {
-	// Op is one of "create", "update", or "delete".
-	Op string `json:"op"`
+// ManifestChange is the JSON payload POSTed to the configured endpoint
+// for every intercepted write. It matches the Python DTO:
+//
+//	@dataclass
+//	class ManifestChange(DataClass):
+//	    db: str
+//	    table: str
+//	    data: dict
+type ManifestChange struct {
+	// DB is the logical database name (from GORMSPAN_DB).
+	DB string `json:"db"`
 
-	// Table is the database table name (e.g. "users").
+	// Table is the database table name. For delete operations this is
+	// "{original_table}_tombstone".
 	Table string `json:"table"`
 
-	// Records contains one map per affected row. Keys are database
-	// column names (from the GORM schema). Shadow columns (_created,
-	// _updated) are included where applicable.
-	Records []map[string]any `json:"records"`
-
-	// Time is the UTC timestamp of the interception (RFC 3339 nano).
-	Time string `json:"time"`
+	// Data is the JSON-serialized row. For tombstones this contains
+	// {id, row, _created}.
+	Data map[string]any `json:"data"`
 }
 
 // ---------------------------------------------------------------------------
@@ -74,9 +90,9 @@ type WriteEvent struct {
 
 // registerInterceptCallbacks sets up Before/After callbacks for
 // gorm:create, gorm:update, and gorm:delete. The "before" callback
-// serializes the write, notifies the endpoint, and injects the
-// sentinel error. The "after" callback clears the sentinel so the
-// caller sees a clean success.
+// serializes the write as a ManifestChange, POSTs it to the endpoint,
+// and injects the sentinel error. The "after" callback clears the
+// sentinel so the caller sees a clean success.
 func registerInterceptCallbacks(db *gorm.DB, cfg Config) {
 	if !cfg.InterceptEnabled || len(cfg.InterceptTables) == 0 {
 		return
@@ -106,9 +122,15 @@ func registerInterceptCallbacks(db *gorm.DB, cfg Config) {
 }
 
 // makeInterceptFn returns a GORM callback that intercepts writes on
-// target tables, serializes the model data (with shadow columns), and
-// POSTs it to the configured NotifyURL. The actual database write is
-// suppressed by injecting errIntercepted.
+// target tables, serializes the row as a ManifestChange, and POSTs it
+// to the configured Endpoint.
+//
+// For create/update operations, the ManifestChange uses the original
+// table name and the row data (with shadow columns injected).
+//
+// For delete operations, the write is converted into a tombstone
+// insertion: the ManifestChange uses "{table}_tombstone" and the data
+// contains {id: pk_value, row: json(original_row), _created: now}.
 func makeInterceptFn(op string, cfg Config) func(*gorm.DB) {
 	return func(tx *gorm.DB) {
 		// Don't interfere if there's already an error.
@@ -133,60 +155,100 @@ func makeInterceptFn(op string, cfg Config) func(*gorm.DB) {
 		// Extract model data from the GORM statement.
 		records := extractRecords(tx)
 
-		// Inject shadow columns.
-		for i := range records {
+		for _, record := range records {
+			var mc ManifestChange
+
 			switch op {
 			case "create":
-				records[i]["_created"] = nowStr
-				records[i]["_updated"] = nowStr
+				record["_created"] = nowStr
+				record["_updated"] = nowStr
+				mc = ManifestChange{
+					DB:    cfg.DBName,
+					Table: table,
+					Data:  record,
+				}
+
 			case "update":
-				records[i]["_updated"] = nowStr
-			// delete: no shadow columns needed (event Time suffices)
+				record["_updated"] = nowStr
+				mc = ManifestChange{
+					DB:    cfg.DBName,
+					Table: table,
+					Data:  record,
+				}
+
+			case "delete":
+				mc = buildTombstone(cfg.DBName, table, record, nowStr)
 			}
-		}
 
-		event := WriteEvent{
-			Op:      op,
-			Table:   table,
-			Records: records,
-			Time:    nowStr,
-		}
-
-		payload, err := json.Marshal(event)
-		if err != nil {
-			_ = tx.AddError(fmt.Errorf("gormspan: marshal write event: %w", err))
-			return
-		}
-
-		// Send to the management service.
-		url := cfg.NotifyURL
-		if url == "" {
-			_ = tx.AddError(fmt.Errorf("gormspan: no NotifyURL configured for write interception"))
-			return
-		}
-
-		resp, err := notifyClient.Post(url, "application/json", bytes.NewReader(payload))
-		if err != nil {
-			_ = tx.AddError(fmt.Errorf("gormspan: intercept notify failed: %w", err))
-			return
-		}
-		defer resp.Body.Close()
-
-		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-			_ = tx.AddError(fmt.Errorf("gormspan: intercept notify returned HTTP %d", resp.StatusCode))
-			return
+			if err := postManifestChange(cfg.Endpoint, mc); err != nil {
+				_ = tx.AddError(err)
+				return
+			}
 		}
 
 		log.Trace().
 			Str("op", op).
 			Str("table", table).
 			Int("records", len(records)).
-			Msg("gormspan: write intercepted and notified")
+			Msg("gormspan: write intercepted")
 
 		// Suppress the database write.
 		tx.RowsAffected = int64(len(records))
 		tx.Error = errIntercepted
 	}
+}
+
+// buildTombstone converts a delete operation into a tombstone
+// ManifestChange. The tombstone table is "{table}_tombstone" and
+// contains:
+//
+//	id       — the primary key value from the original row
+//	row      — full JSON serialization of the original row
+//	_created — timestamp of the deletion
+func buildTombstone(dbName, table string, rowData map[string]any, nowStr string) ManifestChange {
+	// Find the primary key value (prefer "id" column).
+	pkValue := rowData["id"]
+
+	// Serialize the full row as JSON for the "row" column.
+	rowJSON, err := json.Marshal(rowData)
+	if err != nil {
+		rowJSON = []byte("{}")
+	}
+
+	return ManifestChange{
+		DB:    dbName,
+		Table: table + "_tombstone",
+		Data: map[string]any{
+			"id":       pkValue,
+			"row":      string(rowJSON),
+			"_created": nowStr,
+		},
+	}
+}
+
+// postManifestChange serializes the ManifestChange as JSON and POSTs it
+// to the given endpoint URL.
+func postManifestChange(endpoint string, mc ManifestChange) error {
+	if endpoint == "" {
+		return fmt.Errorf("gormspan: no endpoint configured (set GORMSPAN_ENDPOINT)")
+	}
+
+	payload, err := json.Marshal(mc)
+	if err != nil {
+		return fmt.Errorf("gormspan: marshal ManifestChange: %w", err)
+	}
+
+	resp, err := httpClient.Post(endpoint, "application/json", bytes.NewReader(payload))
+	if err != nil {
+		return fmt.Errorf("gormspan: POST to %s failed: %w", endpoint, err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("gormspan: POST to %s returned HTTP %d", endpoint, resp.StatusCode)
+	}
+
+	return nil
 }
 
 // clearInterceptFn runs after the core gorm:create/update/delete

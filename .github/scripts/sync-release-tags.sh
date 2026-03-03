@@ -11,17 +11,46 @@
 
 set -euo pipefail
 
+# ── Configuration ────────────────────────────────────────────────────────
+# Minimum upstream tag to process. Tags older than this are skipped.
+# Override via env: ARMSPAN_MIN_TAG=v0.25.0
+ARMSPAN_MIN_TAG="${ARMSPAN_MIN_TAG:-v0.24.0}"
+
+# Upstream repo URL (override for forks of forks, etc.)
+UPSTREAM_URL="${UPSTREAM_URL:-https://github.com/juanfont/headscale.git}"
+
+# GITHUB_OUTPUT may not exist when running locally.
+GITHUB_OUTPUT="${GITHUB_OUTPUT:-/dev/null}"
+
 # ── Helpers ──────────────────────────────────────────────────────────────
 semver_re='^v[0-9]+\.[0-9]+\.[0-9]+$'
 
 log()  { echo "::group::$*"; }
 endg() { echo "::endgroup::"; }
 
+# version_ge returns 0 (true) if $1 >= $2 using semver sort.
+version_ge() {
+  local highest
+  highest=$(printf '%s\n%s\n' "$1" "$2" | sort -V | tail -n1)
+  [[ "$highest" == "$1" ]]
+}
+
+# ── Ensure upstream remote exists and is fetched ─────────────────────────
+if ! git remote get-url upstream &>/dev/null; then
+  echo "Adding upstream remote: $UPSTREAM_URL"
+  git remote add upstream "$UPSTREAM_URL"
+fi
+
+echo "Fetching upstream main + tags..."
+git fetch upstream main --tags --force
+
 # ── Gather tags ──────────────────────────────────────────────────────────
 mapfile -t upstream_tags < <(
   git tag -l 'v*' --sort=-v:refname |
     grep -E "$semver_re" || true
 )
+
+echo "Minimum tag floor: $ARMSPAN_MIN_TAG"
 
 if [[ ${#upstream_tags[@]} -eq 0 ]]; then
   echo "No upstream semver tags found."
@@ -56,6 +85,12 @@ failed=()
 
 for tag in "${upstream_tags[@]}"; do
   armspan_tag="${tag}-armspan"
+
+  # Skip tags older than the minimum floor.
+  if ! version_ge "$tag" "$ARMSPAN_MIN_TAG"; then
+    skipped+=("$tag (below minimum $ARMSPAN_MIN_TAG)")
+    continue
+  fi
 
   if [[ -n "${existing_armspan[$armspan_tag]:-}" ]]; then
     skipped+=("$tag (already exists)")
