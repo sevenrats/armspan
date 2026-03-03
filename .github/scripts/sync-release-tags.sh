@@ -164,7 +164,7 @@ for tag in "${upstream_tags[@]}"; do
 
   git tag -d "$armspan_tag" 2>/dev/null || true
   git tag "$armspan_tag"
-  git push origin "refs/tags/$armspan_tag"
+  git push github "refs/tags/$armspan_tag"
   created+=("$tag")
   echo "✅ Created $armspan_tag"
 
