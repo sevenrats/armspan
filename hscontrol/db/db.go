@@ -63,10 +63,8 @@ func NewHeadscaleDatabase(
 		return nil, err
 	}
 
-	err = checkVersionUpgradePath(dbConn)
-	if err != nil {
-		return nil, fmt.Errorf("version check: %w", err)
-	}
+	// gormspan: register GORM callbacks (random IDs) before migrations.
+	initGormspanPlugin(dbConn)
 
 	migrations := gormigrate.New(
 		dbConn,

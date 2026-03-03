@@ -1,0 +1,126 @@
+---
+name: Sync upstream
+
+on:
+  schedule:
+    # Daily at 06:00 UTC
+    - cron: "0 6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  issues: write
+  packages: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout armspan
+        uses: actions/checkout@v4
+        with:
+          ref: main-armspan
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure git
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Add upstream remote
+        run: |
+          git remote add upstream https://github.com/juanfont/headscale.git || true
+
+      - name: Fetch upstream
+        run: |
+          git fetch upstream main --tags --force
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # ── Rebase main-armspan onto upstream/main ────────────────────────
+      - name: Rebase main-armspan onto upstream/main
+        id: rebase_branch
+        run: |
+          if git rebase upstream/main; then
+            echo "status=success" >> "$GITHUB_OUTPUT"
+          else
+            git rebase --abort
+            echo "status=conflict" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Force-push main-armspan
+        if: steps.rebase_branch.outputs.status == 'success'
+        run: |
+          git push --force-with-lease origin main-armspan
+
+      - name: Open conflict issue for main-armspan
+        if: steps.rebase_branch.outputs.status == 'conflict'
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const title = '⚠️ Rebase conflict: main-armspan onto upstream/main';
+            const body = [
+              'The daily rebase of `main-armspan` onto `upstream/main` failed due to conflicts.',
+              '',
+              '**Action required:** resolve conflicts manually, then force-push `main-armspan`.',
+              '',
+              `Run ID: [${context.runId}](${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId})`,
+            ].join('\n');
+
+            // Avoid duplicate issues
+            const { data: existing } = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              labels: 'sync-conflict',
+              per_page: 100,
+            });
+            if (existing.some(i => i.title === title)) {
+              console.log('Conflict issue already open — skipping.');
+              return;
+            }
+
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title,
+              body,
+              labels: ['sync-conflict'],
+            });
+
+      # ── Sync release tags ─────────────────────────────────────────────
+      - name: Sync armspan release tags
+        if: steps.rebase_branch.outputs.status == 'success'
+        id: sync_tags
+        run: |
+          bash .github/scripts/sync-release-tags.sh
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Open tag-sync summary issue
+        if: steps.sync_tags.outputs.summary != ''
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const summary = process.env.TAG_SUMMARY;
+            const title = `🏷️ Armspan tag sync — ${new Date().toISOString().slice(0,10)}`;
+            const body = [
+              '## Tag sync results',
+              '',
+              summary,
+              '',
+              `Run ID: [${context.runId}](${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId})`,
+            ].join('\n');
+
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title,
+              body,
+              labels: ['sync-tags'],
+            });
+        env:
+          TAG_SUMMARY: ${{ steps.sync_tags.outputs.summary }}
