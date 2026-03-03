@@ -10,15 +10,10 @@ updates:
     labels:
       - dependencies
       - github-actions
-
-  # Keep Go modules up to date
-  - package-ecosystem: gomod
-    directory: /
-    schedule:
-      interval: weekly
-    labels:
-      - dependencies
-      - go
+    groups:
+      all-dependencies:
+        patterns:
+          - "*"
 
   # Keep Docker base images up to date
   - package-ecosystem: docker
@@ -28,3 +23,7 @@ updates:
     labels:
       - dependencies
       - docker
+    groups:
+      all-dependencies:
+        patterns:
+          - "*"
