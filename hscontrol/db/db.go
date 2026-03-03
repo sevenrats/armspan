@@ -63,8 +63,6 @@ func NewHeadscaleDatabase(
 		return nil, err
 	}
 
-	postOpenDBHook(dbConn) // armspan: plugin hook (see gormspan_init.go)
-
 	migrations := gormigrate.New(
 		dbConn,
 		gormigrate.DefaultOptions,
