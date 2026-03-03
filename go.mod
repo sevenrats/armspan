@@ -53,7 +53,7 @@ require (
 	gopkg.in/yaml.v3 v3.0.1
 	gorm.io/driver/postgres v1.6.0
 	gorm.io/gorm v1.31.1
-	tailscale.com v1.94.1
+	tailscale.com v1.94.2
 	zgo.at/zcache/v2 v2.4.1
 	zombiezen.com/go/postgrestest v1.0.1
 )
