@@ -4,11 +4,11 @@ name: Docker build (armspan tags)
 on:
   push:
     tags:
-      - "v*-armspan"
+      - "v*"
   workflow_dispatch:
     inputs:
       tag:
-        description: "Tag to build (e.g. v0.23.0-armspan)"
+        description: "Tag to build (e.g. v0.28.0)"
         required: true
 
 permissions:
@@ -31,10 +31,8 @@ jobs:
           else
             RAW_TAG="${GITHUB_REF#refs/tags/}"
           fi
-          # Strip the -armspan suffix for the Docker image tag
-          DOCKER_TAG="${RAW_TAG%-armspan}"
-          echo "raw_tag=$RAW_TAG"       >> "$GITHUB_OUTPUT"
-          echo "docker_tag=$DOCKER_TAG" >> "$GITHUB_OUTPUT"
+          echo "raw_tag=$RAW_TAG"     >> "$GITHUB_OUTPUT"
+          echo "docker_tag=$RAW_TAG"  >> "$GITHUB_OUTPUT"
 
       - name: Checkout
         uses: actions/checkout@v4

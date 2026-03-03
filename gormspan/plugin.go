@@ -101,18 +101,28 @@ func (p *Plugin) Name() string {
 // shadow columns on target tables, and registers write interception
 // callbacks.
 func (p *Plugin) Initialize(db *gorm.DB) error {
-	// Register random-ID BeforeCreate callbacks.
-	registerIDCallbacks(db)
-	log.Info().Msg("gormspan: random ID callbacks registered")
+	// Random IDs and shadow columns are only needed when interception is
+	// active (i.e. GORMSPAN_ENDPOINT is configured).  In test / local-only
+	// mode we leave the default auto-increment behaviour untouched so that
+	// upstream tests expecting sequential IDs keep working.
+	if p.cfg.InterceptEnabled {
+		// Register random-ID BeforeCreate callbacks.
+		registerIDCallbacks(db)
+		log.Info().Msg("gormspan: random ID callbacks registered")
 
-	// Ensure shadow columns (_created, _updated) exist on target tables.
-	if p.cfg.InterceptEnabled && len(p.cfg.InterceptTables) > 0 {
-		if err := ensureShadowColumns(db, p.cfg.InterceptTables); err != nil {
-			return fmt.Errorf("gormspan: ensuring shadow columns: %w", err)
+		// Ensure shadow columns (_created, _updated) exist on target tables.
+		if len(p.cfg.InterceptTables) > 0 {
+			if err := ensureShadowColumns(db, p.cfg.InterceptTables); err != nil {
+				return fmt.Errorf("gormspan: ensuring shadow columns: %w", err)
+			}
 		}
+	} else {
+		log.Info().Msg("gormspan: interception disabled — using default auto-increment IDs")
 	}
 
 	// Register write-interception callbacks (create, update, delete).
+	// These are no-ops when InterceptEnabled is false (checked inside
+	// each callback).
 	registerInterceptCallbacks(db, p.cfg)
 
 	return nil
