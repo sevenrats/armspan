@@ -63,10 +63,7 @@ func NewHeadscaleDatabase(
 		return nil, err
 	}
 
-	err = checkVersionUpgradePath(dbConn)
-	if err != nil {
-		return nil, fmt.Errorf("version check: %w", err)
-	}
+	postOpenDBHook(dbConn) // armspan: plugin hook (see gormspan_init.go)
 
 	migrations := gormigrate.New(
 		dbConn,
