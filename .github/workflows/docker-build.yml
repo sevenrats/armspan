@@ -35,7 +35,7 @@ jobs:
           echo "docker_tag=$RAW_TAG"  >> "$GITHUB_OUTPUT"
 
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           ref: ${{ steps.meta_tag.outputs.raw_tag }}
 
