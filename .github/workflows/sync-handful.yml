@@ -9,11 +9,6 @@ on:
   push:
     tags:
       - "v*"
-  workflow_dispatch:
-    inputs:
-      tag:
-        description: "Armspan tag to sync (e.g. v0.28.0)"
-        required: true
 
 permissions:
   contents: read
@@ -25,12 +20,7 @@ jobs:
       - name: Determine tag
         id: meta
         run: |
-          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
-            RAW_TAG="${{ github.event.inputs.tag }}"
-          else
-            RAW_TAG="${GITHUB_REF#refs/tags/}"
-          fi
-          echo "tag=$RAW_TAG" >> "$GITHUB_OUTPUT"
+          echo "tag=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
 
       - name: Checkout armspan (for go.mod and scripts)
         uses: actions/checkout@v4
