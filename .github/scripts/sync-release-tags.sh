@@ -22,7 +22,7 @@ set -uo pipefail
 # NOTE: no -e — we handle errors explicitly so we can always clean up.
 
 # ── Configuration ────────────────────────────────────────────────────────
-ARMSPAN_MIN_TAG="${ARMSPAN_MIN_TAG:-v0.27.0}"
+ARMSPAN_MIN_TAG="${ARMSPAN_MIN_TAG:-v0.28.0}"
 UPSTREAM_URL="${UPSTREAM_URL:-https://github.com/juanfont/headscale.git}"
 GITHUB_OUTPUT="${GITHUB_OUTPUT:-/dev/null}"
 GITHUB_REMOTE="${GITHUB_REMOTE:-github}"
