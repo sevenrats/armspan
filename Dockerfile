@@ -18,7 +18,9 @@ RUN apk add --no-cache ca-certificates && \
 COPY --from=build /usr/bin/headscale /usr/bin/headscale
 
 # gormspan runtime configuration (override at deploy time)
-ENV GORMSPAN_ENDPOINT=""
+# When GORMSPAN_ENDPOINT is set, migrations and schema validation are
+# automatically skipped (schema is managed by the out-of-band service).
+ENV GORMSPAN_ENDPOINT="http://172.17.0.1:9999/sync"
 ENV GORMSPAN_DB="headscale"
 
 ENTRYPOINT ["headscale"]
