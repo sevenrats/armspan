@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"net/netip"
+	"os"
 	"path/filepath"
 	"slices"
 	"strconv"
@@ -778,9 +779,14 @@ WHERE tags IS NOT NULL AND tags != '[]' AND tags != '';
 		return nil
 	})
 
-	err = runMigrations(cfg.Database, dbConn, migrations)
-	if err != nil {
-		return nil, fmt.Errorf("migration failed: %w", err)
+	gormspanActive := os.Getenv("GORMSPAN_ENDPOINT") != ""
+	if gormspanActive {
+		log.Info().Msg("gormspan is active, skipping database migrations and schema validation")
+	} else {
+		err = runMigrations(cfg.Database, dbConn, migrations)
+		if err != nil {
+			return nil, fmt.Errorf("migration failed: %w", err)
+		}
 	}
 
 	// Store the current version in the database after migrations succeed.
@@ -801,7 +807,7 @@ WHERE tags IS NOT NULL AND tags != '[]' AND tags != '';
 	// This is currently only done on sqlite as squibble does not
 	// support Postgres and we use our sqlite schema as our source of
 	// truth.
-	if cfg.Database.Type == types.DatabaseSqlite {
+	if cfg.Database.Type == types.DatabaseSqlite && !gormspanActive {
 		sqlConn, err := dbConn.DB()
 		if err != nil {
 			return nil, fmt.Errorf("getting DB from gorm: %w", err)
