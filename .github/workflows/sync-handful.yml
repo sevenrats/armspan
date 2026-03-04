@@ -31,8 +31,6 @@ jobs:
       - name: Clone handful
         run: |
           git clone https://github.com/sevenrats/handful.git handful
-        env:
-          GITHUB_TOKEN: ${{ secrets.HANDFUL_PAT }}
 
       - name: Run sync script
         run: |
