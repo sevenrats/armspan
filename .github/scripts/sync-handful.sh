@@ -73,16 +73,16 @@ fi
 echo "  Upstream tag ${TS_VERSION} found: $(git rev-parse --short "refs/tags/${TS_VERSION}")"
 
 # ── 4. Determine the handful-specific commits ───────────────────────────
-# main-handful sits on top of origin/main (which tracks upstream tailscale).
-# We need the commits that are on main-handful but NOT on origin/main.
+# main-handful sits on top of upstream tailscale's main branch.
+# We need the commits that are on main-handful but NOT on upstream/main.
 
 if ! git rev-parse origin/main-handful &>/dev/null; then
   echo "ERROR: origin/main-handful branch not found in handful repo"
   exit 1
 fi
 
-# Find the merge base between main-handful and origin/main (upstream).
-HANDFUL_BASE=$(git merge-base origin/main origin/main-handful)
+# Find the merge base between main-handful and upstream/main (tailscale).
+HANDFUL_BASE=$(git merge-base upstream/main origin/main-handful)
 HANDFUL_COMMIT_COUNT=$(git rev-list --count "${HANDFUL_BASE}..origin/main-handful")
 
 echo "  Handful delta: ${HANDFUL_COMMIT_COUNT} commit(s) on top of upstream"
@@ -121,7 +121,7 @@ if ! git rebase --onto "$WORK_BRANCH" "$HANDFUL_BASE" origin/main-handful; then
   echo "  1. Clone sevenrats/handful"
   echo "  2. git fetch upstream (tailscale/tailscale)"
   echo "  3. git checkout -b fix origin/main-handful"
-  echo "  4. git rebase --onto ${TS_VERSION} \$(git merge-base origin/main origin/main-handful)"
+  echo "  4. git rebase --onto ${TS_VERSION} \$(git merge-base upstream/main origin/main-handful)"
   echo "  5. Resolve conflicts, then tag as ${ARMSPAN_TAG} and push"
   git rebase --abort 2>/dev/null || true
   exit 1
