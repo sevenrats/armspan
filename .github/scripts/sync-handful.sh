@@ -53,7 +53,9 @@ if ! git remote get-url upstream &>/dev/null; then
   git remote add upstream https://github.com/tailscale/tailscale.git
 fi
 
-# Configure push URL with PAT for sevenrats/handful.
+# Disable any credential helpers injected by GitHub Actions so the
+# PAT embedded in the remote URL is actually used for pushes.
+git config --local credential.helper ''
 git remote set-url origin "https://x-access-token:${HANDFUL_PAT}@github.com/sevenrats/handful.git"
 
 echo "Fetching upstream tailscale tags..."
