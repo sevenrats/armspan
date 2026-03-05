@@ -13,6 +13,7 @@ import (
 
 	"github.com/rs/zerolog/log"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 // errIntercepted is a sentinel error injected into the GORM callback
@@ -110,19 +111,19 @@ func registerInterceptCallbacks(db *gorm.DB, cfg Config) {
 	// ── Create ──
 	// Intercept before the transaction starts so no lock is acquired.
 	db.Callback().Create().Before("gorm:begin_transaction").
-		Register("gormspan:intercept_create", makeInterceptFn("create", cfg))
+		Register("gormspan:intercept_create", makeInterceptFn("create", cfg, db))
 	db.Callback().Create().After("gorm:commit_or_rollback_transaction").
 		Register("gormspan:clear_intercept_create", clearInterceptFn)
 
 	// ── Update ──
 	db.Callback().Update().Before("gorm:begin_transaction").
-		Register("gormspan:intercept_update", makeInterceptFn("update", cfg))
+		Register("gormspan:intercept_update", makeInterceptFn("update", cfg, db))
 	db.Callback().Update().After("gorm:commit_or_rollback_transaction").
 		Register("gormspan:clear_intercept_update", clearInterceptFn)
 
 	// ── Delete ──
 	db.Callback().Delete().Before("gorm:begin_transaction").
-		Register("gormspan:intercept_delete", makeInterceptFn("delete", cfg))
+		Register("gormspan:intercept_delete", makeInterceptFn("delete", cfg, db))
 	db.Callback().Delete().After("gorm:commit_or_rollback_transaction").
 		Register("gormspan:clear_intercept_delete", clearInterceptFn)
 
@@ -135,13 +136,19 @@ func registerInterceptCallbacks(db *gorm.DB, cfg Config) {
 // target tables, serializes the row as a ManifestChange, and POSTs it
 // to the configured Endpoint.
 //
-// For create/update operations, the ManifestChange uses the original
-// table name and the row data (with shadow columns injected).
+// For create operations, the full row data is sent as-is.
 //
-// For delete operations, the write is converted into a tombstone
-// insertion: the ManifestChange uses "{table}_tombstone" and the data
-// contains {id: pk_value, row: json(original_row), _created: now}.
-func makeInterceptFn(op string, cfg Config) func(*gorm.DB) {
+// For update operations, the current row is read from the database,
+// the new values are merged on top, and the full merged row is sent
+// as if it were an insert. This ensures the receiving end always gets
+// the complete row state.
+//
+// For delete operations, the current row is read, serialized as JSON
+// into the "row" field, and sent as a tombstone to "{table}_tombstone".
+//
+// rootDB is the root *gorm.DB used for read-back queries. Read paths
+// are clean — no interception, no locks.
+func makeInterceptFn(op string, cfg Config, rootDB *gorm.DB) func(*gorm.DB) {
 	return func(tx *gorm.DB) {
 		// Don't interfere if there's already an error.
 		if tx.Error != nil {
@@ -162,78 +169,244 @@ func makeInterceptFn(op string, cfg Config) func(*gorm.DB) {
 		now := time.Now().UTC()
 		nowStr := now.Format(time.RFC3339Nano)
 
-		// Extract model data from the GORM statement.
-		records := extractRecords(tx)
+		switch op {
+		case "create":
+			records := extractRecords(tx)
 
-		for _, record := range records {
-			var mc ManifestChange
-
-			switch op {
-			case "create":
+			for _, record := range records {
 				record["_created"] = nowStr
 				record["_updated"] = nowStr
-				mc = ManifestChange{
+
+				mc := ManifestChange{
 					DB:    cfg.DBName,
 					Table: table,
 					Data:  record,
 				}
 
-			case "update":
-				record["_updated"] = nowStr
-				mc = ManifestChange{
-					DB:    cfg.DBName,
-					Table: table,
-					Data:  record,
+				if err := postManifestChange(cfg.Endpoint, mc); err != nil {
+					_ = tx.AddError(err)
+					return
+				}
+			}
+
+			log.Trace().
+				Str("op", op).
+				Str("table", table).
+				Int("records", len(records)).
+				Msg("gormspan: create intercepted")
+
+			tx.RowsAffected = int64(len(records))
+
+		case "update":
+			// For updates we send the full NEW row state.
+			// 1. Extract the partial changes from the GORM statement.
+			// 2. Determine the PK of the row being updated.
+			// 3. Read the current full row from the DB.
+			// 4. Merge the changes on top → full new row.
+			// 5. POST as if it were an insert.
+			partials := extractRecords(tx)
+
+			for _, partial := range partials {
+				pkValue := partial["id"]
+				if pkValue == nil {
+					log.Warn().
+						Str("table", table).
+						Msg("gormspan: update has no PK, skipping")
+					continue
 				}
 
-			case "delete":
-				mc = buildTombstone(cfg.DBName, table, record, nowStr)
+				// Read current row from DB (read path is clean).
+				fullRow := readCurrentRow(rootDB, table, pkValue)
+
+				// Merge partial changes on top of the full row.
+				if fullRow != nil {
+					for k, v := range partial {
+						fullRow[k] = v
+					}
+				} else {
+					// No existing row (race or new row via Updates/Save).
+					// Send what we have.
+					fullRow = partial
+				}
+
+				fullRow["_updated"] = nowStr
+
+				mc := ManifestChange{
+					DB:    cfg.DBName,
+					Table: table,
+					Data:  fullRow,
+				}
+
+				if err := postManifestChange(cfg.Endpoint, mc); err != nil {
+					_ = tx.AddError(err)
+					return
+				}
+			}
+
+			log.Trace().
+				Str("op", op).
+				Str("table", table).
+				Int("records", len(partials)).
+				Msg("gormspan: update intercepted")
+
+			tx.RowsAffected = int64(len(partials))
+
+		case "delete":
+			// Read the full row, then send a tombstone with the row JSON.
+			pkValue := extractDeletePK(tx)
+
+			fullRow := readCurrentRow(rootDB, table, pkValue)
+
+			// Serialize the full row as JSON for the "row" column.
+			var rowJSON string
+			if fullRow != nil {
+				b, err := json.Marshal(fullRow)
+				if err != nil {
+					rowJSON = "{}"
+				} else {
+					rowJSON = string(b)
+				}
+			} else {
+				rowJSON = "{}"
+			}
+
+			mc := ManifestChange{
+				DB:    cfg.DBName,
+				Table: table + "_tombstones",
+				Data: map[string]any{
+					"id":       pkValue,
+					"row":      rowJSON,
+					"_created": nowStr,
+				},
 			}
 
 			if err := postManifestChange(cfg.Endpoint, mc); err != nil {
 				_ = tx.AddError(err)
 				return
 			}
+
+			log.Trace().
+				Str("op", op).
+				Str("table", table).
+				Interface("pk", pkValue).
+				Msg("gormspan: delete intercepted")
+
+			tx.RowsAffected = 1
 		}
 
-		log.Trace().
-			Str("op", op).
-			Str("table", table).
-			Int("records", len(records)).
-			Msg("gormspan: write intercepted")
-
 		// Suppress the database write.
-		tx.RowsAffected = int64(len(records))
 		tx.Error = errIntercepted
 	}
 }
 
-// buildTombstone converts a delete operation into a tombstone
-// ManifestChange. The tombstone table is "{table}_tombstone" and
-// contains:
-//
-//	id       — the primary key value from the original row
-//	row      — full JSON serialization of the original row
-//	_created — timestamp of the deletion
-func buildTombstone(dbName, table string, rowData map[string]any, nowStr string) ManifestChange {
-	// Find the primary key value (prefer "id" column).
-	pkValue := rowData["id"]
+// readCurrentRow reads the full current row from the database by PK.
+// Uses a direct SQL query to get a map of all column values, avoiding
+// any model/schema dependency. The read path is clean — no interception.
+func readCurrentRow(db *gorm.DB, table string, pkValue any) map[string]any {
+	if pkValue == nil {
+		return nil
+	}
 
-	// Serialize the full row as JSON for the "row" column.
-	rowJSON, err := json.Marshal(rowData)
+	//nolint:perfsprint // table name is safe (from InterceptTables keys)
+	query := fmt.Sprintf(`SELECT * FROM "%s" WHERE id = ? LIMIT 1`, table)
+
+	rows, err := db.Raw(query, pkValue).Rows()
 	if err != nil {
-		rowJSON = []byte("{}")
+		log.Warn().Err(err).Str("table", table).Msg("gormspan: failed to read current row")
+		return nil
+	}
+	defer rows.Close()
+
+	if !rows.Next() {
+		return nil
 	}
 
-	return ManifestChange{
-		DB:    dbName,
-		Table: table + "_tombstone",
-		Data: map[string]any{
-			"id":       pkValue,
-			"row":      string(rowJSON),
-			"_created": nowStr,
-		},
+	colNames, err := rows.Columns()
+	if err != nil {
+		return nil
 	}
+
+	values := make([]any, len(colNames))
+	valuePtrs := make([]any, len(colNames))
+	for i := range values {
+		valuePtrs[i] = &values[i]
+	}
+
+	if err := rows.Scan(valuePtrs...); err != nil {
+		log.Warn().Err(err).Str("table", table).Msg("gormspan: failed to scan current row")
+		return nil
+	}
+
+	result := make(map[string]any, len(colNames))
+	for i, colName := range colNames {
+		v := values[i]
+		// SQLite returns []byte for TEXT columns; convert to string.
+		if b, ok := v.([]byte); ok {
+			result[colName] = string(b)
+		} else {
+			result[colName] = v
+		}
+	}
+
+	return result
+}
+
+// extractDeletePK extracts the primary key value from a GORM delete
+// statement. GORM's Delete() can be called in several ways:
+//
+//	tx.Delete(&Node{}, nodeID)          → Clauses WHERE Eq{PrimaryColumn, nodeID}
+//	tx.Delete(&Node{ID: nodeID})        → Vars = [], PK on struct
+//	tx.Delete(&PreAuthKey{ID: keyID})   → Vars = [], PK on struct
+//	tx.Where("id = ?", id).Delete(...)  → Vars = [id] (from Where)
+//
+// We check Vars first, then the Dest struct, then WHERE clauses.
+func extractDeletePK(tx *gorm.DB) any {
+
+	// 1. Check positional args from .Where("id = ?", id).
+	if len(tx.Statement.Vars) > 0 {
+		return tx.Statement.Vars[0]
+	}
+
+	// 2. Read PK from the Dest struct via schema introspection.
+	if tx.Statement.Schema != nil {
+		rv := tx.Statement.ReflectValue
+		for rv.Kind() == reflect.Ptr {
+			rv = rv.Elem()
+		}
+
+		for _, field := range tx.Statement.Schema.PrimaryFields {
+			val, isZero := field.ValueOf(tx.Statement.Context, rv)
+			if !isZero {
+				return val
+			}
+		}
+	}
+
+	// 3. Check WHERE clauses for primary key conditions.
+	// Handles .Delete(&Model{}, id) where GORM's BuildCondition
+	// puts id into clause.Eq{Column: PrimaryColumn, Value: id}.
+	if whereClause, ok := tx.Statement.Clauses["WHERE"]; ok {
+		if where, ok := whereClause.Expression.(clause.Where); ok {
+			for _, expr := range where.Exprs {
+				if eq, ok := expr.(clause.Eq); ok {
+					// Check if this is the primary key sentinel.
+					if col, ok := eq.Column.(clause.Column); ok && col.Name == clause.PrimaryKey {
+						return eq.Value
+					}
+					// Also accept explicit "id" column.
+					if col, ok := eq.Column.(clause.Column); ok && col.Name == "id" {
+						return eq.Value
+					}
+				}
+			}
+		}
+	}
+
+	log.Warn().
+		Str("table", tx.Statement.Table).
+		Msg("gormspan: could not extract PK from delete statement")
+
+	return nil
 }
 
 // postManifestChange serializes the ManifestChange as JSON and POSTs it
@@ -275,7 +448,15 @@ func clearInterceptFn(tx *gorm.DB) {
 // ---------------------------------------------------------------------------
 
 // extractRecords builds a []map[column→value] from the GORM statement.
-// Handles both single-record and batch (slice) operations.
+// Handles:
+//   - Struct models (Create, Save, Updates with struct) → full field extraction
+//   - Slices of structs (batch Create) → per-element extraction
+//   - Maps (single-column .Update("col", val) or .Updates(map[...])) → direct map
+//
+// For map-based updates (partial column changes), GORM's ReflectValue
+// is a map, not a struct, so we cannot use schema introspection. We
+// read the map directly and inject the primary key from Statement.Vars
+// so the receiving end knows which row was affected.
 func extractRecords(tx *gorm.DB) []map[string]any {
 	if tx.Statement == nil || tx.Statement.Schema == nil {
 		return nil
@@ -283,14 +464,71 @@ func extractRecords(tx *gorm.DB) []map[string]any {
 
 	rv := tx.Statement.ReflectValue
 	switch rv.Kind() {
+	case reflect.Map:
+		// Partial update: .Update("col", val) or .Updates(map[string]any{...})
+		record := make(map[string]any)
+		for _, key := range rv.MapKeys() {
+			record[fmt.Sprint(key.Interface())] = rv.MapIndex(key).Interface()
+		}
+
+		// Inject the primary key from Where conditions so the
+		// receiving end knows which row is being updated.
+		injectPKFromVars(tx, record)
+
+		return []map[string]any{record}
+
 	case reflect.Slice, reflect.Array:
 		records := make([]map[string]any, 0, rv.Len())
 		for i := 0; i < rv.Len(); i++ {
 			records = append(records, extractFields(tx.Statement, rv.Index(i)))
 		}
 		return records
+
 	default:
+		// Struct model (Create, Save, Updates with struct).
 		return []map[string]any{extractFields(tx.Statement, rv)}
+	}
+}
+
+// injectPKFromVars tries to add the primary key to a partial-update
+// record. For calls like:
+//
+//	tx.Model(&Node{}).Where("id = ?", nodeID).Update("col", val)
+//
+// The PK lives in Statement.Vars (from the Where clause).
+// For calls like:
+//
+//	tx.Model(node).Update("col", val)    // node has ID set
+//
+// The PK lives on the Model struct's primary key field.
+func injectPKFromVars(tx *gorm.DB, record map[string]any) {
+	// Already has an "id" key — nothing to do.
+	if _, ok := record["id"]; ok {
+		return
+	}
+
+	// 1. Try the Model's primary key field (e.g. tx.Model(node) where
+	//    node.ID is set).
+	if tx.Statement.Model != nil && tx.Statement.Schema != nil {
+		modelRV := reflect.ValueOf(tx.Statement.Model)
+		for modelRV.Kind() == reflect.Ptr {
+			modelRV = modelRV.Elem()
+		}
+		if modelRV.Kind() == reflect.Struct {
+			for _, field := range tx.Statement.Schema.PrimaryFields {
+				val, isZero := field.ValueOf(tx.Statement.Context, modelRV)
+				if !isZero {
+					record[field.DBName] = val
+					return
+				}
+			}
+		}
+	}
+
+	// 2. Fall back to Statement.Vars (from .Where("id = ?", id)).
+	// Convention: the first var that looks like an integer PK.
+	if len(tx.Statement.Vars) > 0 {
+		record["id"] = tx.Statement.Vars[0]
 	}
 }
 
