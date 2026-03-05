@@ -5,13 +5,9 @@ package db
 // This file is specific to the armspan fork. It is a NEW file (not
 // present upstream) so it never causes rebase conflicts.
 //
-// The sync-release-tags.sh script injects a one-line call into db.go
-// via sed when building release tags:
-//
-//	postOpenDBHook(dbConn)
-//
-// On main-armspan this file simply defines the function. The hook
-// line is only present in versioned *-armspan tags.
+// The postOpenDBHook call is present in db.go and invoked immediately
+// after gorm.Open succeeds. When GORMSPAN_ENDPOINT is set, random IDs,
+// shadow columns, and write interception are all activated.
 //
 // Configuration is via environment variables:
 //
