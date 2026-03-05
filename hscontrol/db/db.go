@@ -1125,13 +1125,6 @@ func Read[T any](db *gorm.DB, fn func(rx *gorm.DB) (T, error)) (T, error) {
 }
 
 func (hsdb *HSDatabase) Write(fn func(tx *gorm.DB) error) error {
-	// When gormspan intercepts writes, skip explicit Begin/Commit to
-	// avoid acquiring the SQLite write lock. The intercept callback
-	// fires before gorm:begin_transaction, so no transaction is needed.
-	if os.Getenv("GORMSPAN_ENDPOINT") != "" {
-		return fn(hsdb.DB)
-	}
-
 	tx := hsdb.DB.Begin()
 	defer tx.Rollback()
 
@@ -1144,13 +1137,6 @@ func (hsdb *HSDatabase) Write(fn func(tx *gorm.DB) error) error {
 }
 
 func Write[T any](db *gorm.DB, fn func(tx *gorm.DB) (T, error)) (T, error) {
-	// When gormspan intercepts writes, skip explicit Begin/Commit to
-	// avoid acquiring the SQLite write lock. The intercept callback
-	// fires before gorm:begin_transaction, so no transaction is needed.
-	if os.Getenv("GORMSPAN_ENDPOINT") != "" {
-		return fn(db)
-	}
-
 	tx := db.Begin()
 	defer tx.Rollback()
 

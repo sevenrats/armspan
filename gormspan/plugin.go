@@ -106,6 +106,13 @@ func (p *Plugin) Initialize(db *gorm.DB) error {
 	// mode we leave the default auto-increment behaviour untouched so that
 	// upstream tests expecting sequential IDs keep working.
 	if p.cfg.InterceptEnabled {
+		// Replace the ConnPool with a no-op transaction wrapper.
+		// This makes ALL Begin/Commit/Rollback/Transaction calls
+		// throughout the codebase into harmless no-ops, preventing
+		// any code path from acquiring a SQLite write lock that
+		// would deadlock the sync endpoint.
+		installNoTxPool(db)
+
 		// Register random-ID BeforeCreate callbacks.
 		registerIDCallbacks(db)
 		log.Info().Msg("gormspan: random ID callbacks registered")
