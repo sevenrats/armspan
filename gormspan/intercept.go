@@ -3,6 +3,7 @@ package gormspan
 import (
 	"bytes"
 	"context"
+	"database/sql/driver"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -91,29 +92,38 @@ type ManifestChange struct {
 // registerInterceptCallbacks sets up Before/After callbacks for
 // gorm:create, gorm:update, and gorm:delete. The "before" callback
 // serializes the write as a ManifestChange, POSTs it to the endpoint,
+// serializes the write as a ManifestChange, POSTs it to the endpoint,
 // and injects the sentinel error. The "after" callback clears the
 // sentinel so the caller sees a clean success.
+//
+// IMPORTANT: The intercept callbacks are registered BEFORE
+// gorm:begin_transaction (not before gorm:create). This ensures
+// GORM never acquires a SQLite write lock for intercepted operations.
+// Otherwise the synchronous POST to the Python endpoint would deadlock:
+// Go holds the SQLite lock waiting for the HTTP response, while Python
+// tries to INSERT into the same database.
 func registerInterceptCallbacks(db *gorm.DB, cfg Config) {
 	if !cfg.InterceptEnabled || len(cfg.InterceptTables) == 0 {
 		return
 	}
 
 	// ── Create ──
-	db.Callback().Create().Before("gorm:create").
+	// Intercept before the transaction starts so no lock is acquired.
+	db.Callback().Create().Before("gorm:begin_transaction").
 		Register("gormspan:intercept_create", makeInterceptFn("create", cfg))
-	db.Callback().Create().After("gorm:create").Before("gorm:after_create").
+	db.Callback().Create().After("gorm:commit_or_rollback_transaction").
 		Register("gormspan:clear_intercept_create", clearInterceptFn)
 
 	// ── Update ──
-	db.Callback().Update().Before("gorm:update").
+	db.Callback().Update().Before("gorm:begin_transaction").
 		Register("gormspan:intercept_update", makeInterceptFn("update", cfg))
-	db.Callback().Update().After("gorm:update").Before("gorm:after_update").
+	db.Callback().Update().After("gorm:commit_or_rollback_transaction").
 		Register("gormspan:clear_intercept_update", clearInterceptFn)
 
 	// ── Delete ──
-	db.Callback().Delete().Before("gorm:delete").
+	db.Callback().Delete().Before("gorm:begin_transaction").
 		Register("gormspan:intercept_delete", makeInterceptFn("delete", cfg))
-	db.Callback().Delete().After("gorm:delete").Before("gorm:after_delete").
+	db.Callback().Delete().After("gorm:commit_or_rollback_transaction").
 		Register("gormspan:clear_intercept_delete", clearInterceptFn)
 
 	log.Info().
@@ -286,11 +296,119 @@ func extractRecords(tx *gorm.DB) []map[string]any {
 
 // extractFields reads every field defined in the GORM schema from the
 // given reflect.Value and returns a column-name → value map.
+//
+// Fields that use a GORM serializer (serializer:json, serializer:text)
+// are converted to their database representation via the serializer's
+// Value method. This avoids JSON-marshal cycles caused by complex Go
+// types (key.MachinePublic, tailcfg.Hostinfo, etc.) whose internal
+// structure may reference *schema.Field.
+//
+// After extraction, values are normalized for JSON-flat serialization:
+//   - sql.Null* wrappers are flattened (Valid=false → nil, Valid=true → inner value)
+//   - time.Time values are forced to UTC so timestamps always carry a timezone
 func extractFields(stmt *gorm.Statement, rv reflect.Value) map[string]any {
 	data := make(map[string]any)
 	for _, field := range stmt.Schema.Fields {
+		// Skip pseudo-fields that don't map to a database column.
+		if field.DBName == "" {
+			continue
+		}
+
 		val, _ := field.ValueOf(stmt.Context, rv)
+
+		// For serializer-backed fields, convert to the DB
+		// representation (string / []byte) so the payload stays
+		// JSON-safe and cycle-free.
+		if field.Serializer != nil {
+			dbVal, err := field.Serializer.Value(stmt.Context, field, rv, val)
+			if err == nil {
+				data[field.DBName] = dbVal
+				continue
+			}
+			// Fallback: use fmt.Sprint so we never produce
+			// an unmarshalable value.
+			data[field.DBName] = fmt.Sprint(val)
+			continue
+		}
+
 		data[field.DBName] = val
 	}
+
+	normalizeValues(data)
 	return data
+}
+
+// normalizeValues makes a map JSON-flat and Python-friendly in place.
+//
+//  1. sql.Null* wrappers (sql.NullString, sql.NullInt64, …) are
+//     flattened: if Valid is false the key becomes nil (JSON null);
+//     if Valid is true the inner scalar is unwrapped. Detection is
+//     generic via the driver.Valuer interface that all sql.Null*
+//     types implement.
+//
+//  2. time.Time values are forced to UTC so every timestamp carries
+//     an explicit timezone indicator (the Z suffix in RFC 3339).
+//     Python's datetime.fromisoformat() then returns an offset-aware
+//     datetime, preventing comparison TypeErrors on the receiving end.
+func normalizeValues(data map[string]any) {
+	for k, v := range data {
+		if v == nil {
+			continue
+		}
+
+		// --- time.Time → .UTC() ---
+		switch tv := v.(type) {
+		case time.Time:
+			data[k] = tv.UTC()
+			continue
+		case *time.Time:
+			if tv != nil {
+				utc := tv.UTC()
+				data[k] = &utc
+			}
+			continue
+		}
+
+		// --- sql.Null* → flatten via driver.Valuer ---
+		// All sql.Null* types implement driver.Valuer. Valuer.Value()
+		// returns (nil, nil) when Valid=false and (innerVal, nil) when
+		// Valid=true — exactly the flattening we need.
+		//
+		// We also need the pointer form: field.ValueOf can return the
+		// struct directly *or* behind a pointer, and reflect wraps it
+		// in an interface. Check both the value and its addressable
+		// (pointer) form.
+		if flat, ok := flattenNullable(v); ok {
+			data[k] = flat
+			continue
+		}
+	}
+}
+
+// flattenNullable checks whether v implements driver.Valuer (the
+// interface all sql.Null* types satisfy). If so it calls Value() to
+// flatten: Valid=false → nil, Valid=true → inner scalar.
+// Returns the flattened value and true, or (nil, false) if v is not
+// a Valuer.
+func flattenNullable(v any) (any, bool) {
+	// Try v directly.
+	if valuer, ok := v.(driver.Valuer); ok {
+		dbVal, _ := valuer.Value()
+		return dbVal, true
+	}
+
+	// Try pointer-to-v (sql.Null* methods have value receivers, but
+	// the concrete value may be wrapped in an interface without being
+	// addressable).
+	rv := reflect.ValueOf(v)
+	if rv.Kind() == reflect.Struct {
+		ptr := reflect.New(rv.Type())
+		ptr.Elem().Set(rv)
+		if valuer, ok := ptr.Interface().(driver.Valuer); ok {
+			dbVal, _ := valuer.Value()
+			return dbVal, true
+		}
+	}
+
+	return nil, false
 }

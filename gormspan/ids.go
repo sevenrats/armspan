@@ -26,8 +26,13 @@ func randomID() (uint64, error) {
 // random ID to any model whose primary key is an integer type with a
 // zero value. This works generically via GORM's schema introspection
 // — no upstream type modifications required.
+//
+// The callback is registered before gorm:begin_transaction so that the
+// random ID is already set on the model when the intercept callback
+// (also before gorm:begin_transaction, but registered later) serializes
+// the fields for the POST payload.
 func registerIDCallbacks(db *gorm.DB) {
-	db.Callback().Create().Before("gorm:create").
+	db.Callback().Create().Before("gorm:begin_transaction").
 		Register("gormspan:randomize_id", randomizeIDCallback)
 }
 
