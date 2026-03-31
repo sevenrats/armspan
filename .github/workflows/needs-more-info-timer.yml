@@ -35,7 +35,7 @@ jobs:
     permissions:
       issues: write
     steps:
-      - uses: hustcer/setup-nu@920172d92eb04671776f3ba69d605d3b09351c30 # v3.22
+      - uses: hustcer/setup-nu@92c296ba1ba2ba04cc948ab64ddefe192dc13f0c # v3.23
         with:
           version: "*"
 
